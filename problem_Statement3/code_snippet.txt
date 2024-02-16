@@ -32,5 +32,14 @@ func main() {
    * Buffered channel :       * the channel is buffered with the capacity 10 
 
 3.What is the significance of the for loop with 4 iterations?
-   * 
+   * the significanceof the loop with 4 iterationsis to create multiple goroutines that concurrently consume
+    tasks from the channel "cnp" enabling concurrently execution of the tasks and efficient utilization of resources
 
+4.What is the significance of make(chan func(), 10)?
+   *  this is used to create a channel and its a buffered channel which can hold 10 values
+     the recevier is blocked untile sender send the values to the channels and via versa
+
+5.Why is “HERE1” not getting printed?
+   * RACE Condition 
+         where the main goroutines sends the task to channel 'cnp' but none of the goroutines
+         are able to recevie it before the main goroutines prints "HELLO" and exits

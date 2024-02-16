@@ -1,11 +1,18 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
-func main() {
-	cnp := make(chan func(), 4)
+func Correct_code() {
+	cnp := make(chan func(), 10)
+	var wg sync.WaitGroup
+	wg.Add(4)
+
 	for i := 0; i < 4; i++ {
 		go func() {
+			defer wg.Done()
 			for f := range cnp {
 				f()
 			}
@@ -15,6 +22,7 @@ func main() {
 		fmt.Println("HERE1")
 	}
 	close(cnp)
-	Correct_code()
+	wg.Wait()
+
 	fmt.Println("Hello")
 }
