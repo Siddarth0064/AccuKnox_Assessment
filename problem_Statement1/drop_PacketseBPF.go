@@ -1,89 +1,156 @@
 package main
 
 import (
-	"flag"
+	"encoding/binary"
 	"fmt"
-	//"github.com/DataDog/ebpf-manager"
-	"github.com/cilium/ebpf"
-	//"github.com/golang/groupcache/xmc"
-	"math"
+	"net"
 	"os"
-	"strings"
+	"os/signal"
 	"syscall"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/perf"
 )
 
 const (
-	filterSource = `
-#include <linux/skbuff.h>
-#include <linux/ip.h>
-#include <linux/tcp.h>
+	TYPE_ENTER = 1
+	TYPE_DROP  = 2
+	TYPE_PASS  = 3
+)
 
-#define ETH_HLEN 14
-
-int drop_packet(struct __sk_buff *skb) {
-    struct ethhdr *eth = bpf_hdr_pointer(skb, 0);
-    struct iphdr *ip = (struct iphdr *)(eth + 1);
-    if (ip->protocol == IPPROTO_TCP) {
-        struct tcphdr *tcp = (struct tcphdr *)((__u32 *)ip + ip->ihl);
-        if (tcp->dest == %d) {
-            return -1; // Drop packet
-        }
-    }
-    return 0; // Accept packet
+type event struct {
+	TimeSinceBoot  uint64
+	ProcessingTime uint32
+	Type           uint8
 }
-`
-)
 
-var (
-	port = flag.Int("port", 4040, "TCP port number to drop packets")
-)
+const ringBufferSize = 128 // size of ring buffer used to calculate average processing times
+type ringBuffer struct {
+	data    [ringBufferSize]uint32
+	start   int
+	pointer int
+	filled  bool
+}
+
+func (rb *ringBuffer) add(val uint32) {
+	if rb.pointer < ringBufferSize {
+		rb.pointer++
+	} else {
+		rb.filled = true
+		rb.pointer = 1
+	}
+	rb.data[rb.pointer-1] = val
+}
+
+func (rb *ringBuffer) avg() float32 {
+	if rb.pointer == 0 {
+		return 0
+	}
+	sum := uint32(0)
+	for _, val := range rb.data {
+		sum += uint32(val)
+	}
+	if rb.filled {
+		return float32(sum) / float32(ringBufferSize)
+	}
+	return float32(sum) / float32(rb.pointer)
+}
 
 func main() {
-	flag.Parse()
-
-	// Load the eBPF object file
-	obj, err := ebpf.LoadObjectFile("drop_packet.o")
+	spec, err := ebpf.LoadCollectionSpec("program.o")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load eBPF object: %v\n", err)
-		os.Exit(1)
+		panic(err)
 	}
 
-	// Find the program by name in the object
-	prog := obj.GetProgramByName("drop_packet")
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to create new collection: %v\n", err))
+	}
+	defer coll.Close()
+
+	prog := coll.Programs["xdp_dilih"]
 	if prog == nil {
-		fmt.Fprintf(os.Stderr, "Function 'drop_packet' not found in the object\n")
-		os.Exit(1)
+		panic("No program named 'xdp_dilih' found in collection")
 	}
 
-	// Attach the eBPF program to the ingress hook of the network device
-	err = syscall.SetsockoptString(sock, syscall.SOL_SOCKET, syscall.SO_ATTACH_FILTER, prog.FD())
+	iface := os.Getenv("INTERFACE")
+	if iface == "" {
+		panic("No interface specified. Please set the INTERFACE environment variable to the name of the interface to be use")
+	}
+	iface_idx, err := net.InterfaceByName(iface)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to attach eBPF program to socket filter: %v\n", err)
-		os.Exit(1)
+		panic(fmt.Sprintf("Failed to get interface %s: %v\n", iface, err))
+	}
+	opts := link.XDPOptions{
+		Program:   prog,
+		Interface: iface_idx.Index,
+		// Flags is one of XDPAttachFlags (optional).
+	}
+	lnk, err := link.AttachXDP(opts)
+	if err != nil {
+		panic(err)
+	}
+	defer lnk.Close()
+
+	fmt.Println("Successfully loaded and attached BPF program.")
+
+	// handle perf events
+	outputMap, ok := coll.Maps["output_map"]
+	if !ok {
+		panic("No map named 'output_map' found in collection")
+	}
+	perfEvent, err := perf.NewReader(outputMap, 4096)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to create perf event reader: %v\n", err))
+	}
+	defer perfEvent.Close()
+	buckets := map[uint8]uint32{
+		TYPE_ENTER: 0, // bpf program entered
+		TYPE_DROP:  0, // bpf program dropped
+		TYPE_PASS:  0, // bpf program passed
 	}
 
-	fmt.Printf("Dropping TCP packets on port %d...\n", *port)
+	processingTimePassed := &ringBuffer{}
+	processingTimeDropped := &ringBuffer{}
 
-	// Infinite loop to continuously filter packets
-	for {
-		buf := make([]byte, 65535)
-		n, _, err := syscall.Recvfrom(sock, buf, 0)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error receiving packet: %v\n", err)
-			continue
+	go func() {
+		// var event event
+		for {
+			record, err := perfEvent.Read()
+			if err != nil {
+				fmt.Println(err)
+				continue
+			}
+
+			var e event
+			if len(record.RawSample) < 12 {
+				fmt.Println("Invalid sample size")
+				continue
+			}
+			// time since boot in the first 8 bytes
+			e.TimeSinceBoot = binary.LittleEndian.Uint64(record.RawSample[:8])
+			// processing time in the next 4 bytes
+			e.ProcessingTime = binary.LittleEndian.Uint32(record.RawSample[8:12])
+			// type in the last byte
+			e.Type = uint8(record.RawSample[12])
+			buckets[e.Type]++
+
+			if e.Type == TYPE_ENTER {
+				continue
+			}
+			if e.Type == TYPE_DROP {
+				processingTimeDropped.add(e.ProcessingTime)
+			} else if e.Type == TYPE_PASS {
+				processingTimePassed.add(e.ProcessingTime)
+			}
+
+			fmt.Print("\033[H\033[2J")
+			fmt.Printf("total: %d. passed: %d. dropped: %d. passed processing time avg (ns): %f. dropped processing time avg (ns): %f\n", buckets[TYPE_ENTER], buckets[TYPE_PASS], buckets[TYPE_DROP], processingTimePassed.avg(), processingTimeDropped.avg())
 		}
-		// Execute the eBPF filter on the received packet
-		action, _, err := prog.Test(buf[:n])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error executing eBPF filter: %v\n", err)
-			continue
-		}
-		// Drop the packet if the eBPF program returned -1
-		if action == math.MaxUint32 {
-			fmt.Println("Packet dropped")
-			continue
-		}
-		// Otherwise, accept the packet
-		fmt.Println("Packet accepted")
-	}
+	}()
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	<-c
 }

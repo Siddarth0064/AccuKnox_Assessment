@@ -1,0 +1,36 @@
+package main
+import "fmt"
+func main() {
+    cnp := make(chan func(), 10)
+    for i := 0; i< 4; i++ {
+     go func() {
+      for f := range cnp {
+        f()
+      }
+     }()
+    }
+    cnp <-  func() {
+      fmt.Println("HERE1&quot")
+    }
+   fmt.Println("Hello")
+}
+
+1. Explaining how the highlighted constructs work?
+    * line number 4  is a Buffered channel with the size of 10 which can hold 
+      10 values and it will block the recevier untile Buffered channel is full and 
+      it will ready to send the data to the recevier while sender will blocked
+    * line number 5 to 11 is a loop for sending the data to a goroutines anonymous
+      function which recevier will blocked untile the size is filled so loop size is 4 which means
+      the channel will never filled
+    * line number 12 is a function to collect the data to channel  
+
+2. Giving use-cases of what these constructs could be used for.
+   * goroutines and channels: * the goroutines are lightweight threads of execution
+                              * channels are used to communicate with the multiple goroutines
+   * anonymous function :     * anonymous function are functions with out name they are defined inline and can be used immediately
+
+   * Buffered channel :       * the channel is buffered with the capacity 10 
+
+3.What is the significance of the for loop with 4 iterations?
+   * 
+

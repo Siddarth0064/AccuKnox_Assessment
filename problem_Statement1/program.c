@@ -1,19 +1,57 @@
-// #include <linux/bpf.h>
-// #include <linux/pkt_cls.h>
-// #define PORT 4040
+#include <linux/bpf.h>
+#include <bpf_helpers.h>
 
+#define TYPE_ENTER 1
+#define TYPE_DROP 2
+#define TYPE_PASS 3
 
-// SEC("filter")
-// int drop_tcp_packets(struct __sk_buff *skb) {
-//   struct ethhdr *eth = bpf_hdr_pointer(skb, 0);
-//   struct iphdr *ip = (struct iphdr *)(eth + 1);
-//   struct tcphdr *tcp = (struct tcphdr *)(ip + 1);
+struct perf_trace_event {
+	__u64 timestamp; // time elapsed since boot, excluding suspend time. see https://www.man7.org/linux/man-pages/man7/bpf-helpers.7.html
+	__u32 processing_time_ns;
+	__u8 type;
+};
 
-//   if (ip->protocol == IPPROTO_TCP && tcp->dest == htons(PORT)) {
-//     return TC_ACT_SHOT;
-//   }
+struct {
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(int));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, 1024);
+} output_map SEC(".maps");
 
-//   return TC_ACT_OK;
-// }
+SEC("xdp")
+int xdp_dilih(struct xdp_md *ctx)
+{
+	struct perf_trace_event e = {};
 
-// char _license[] SEC("license") = "GPL";
+	// perf event for entering xdp program
+	e.timestamp = bpf_ktime_get_ns();
+	e.type = TYPE_ENTER;
+	e.processing_time_ns = 0;
+	bpf_perf_event_output(ctx, &output_map, BPF_F_CURRENT_CPU, &e, sizeof(e));
+	
+	if (bpf_get_prandom_u32() % 2 == 0) {
+
+		// perf event for dropping packet
+		e.type = TYPE_DROP;
+		__u64 ts = bpf_ktime_get_ns();
+		e.processing_time_ns = ts - e.timestamp;
+		e.timestamp = ts;
+		bpf_perf_event_output(ctx, &output_map, BPF_F_CURRENT_CPU, &e, sizeof(e));
+
+		bpf_printk("dropping packet");
+		return XDP_DROP;
+	}
+
+	// perf event for passing packet
+	e.type = TYPE_PASS;
+	__u64 ts = bpf_ktime_get_ns();
+	e.processing_time_ns = ts - e.timestamp;
+	e.timestamp = ts;
+
+	bpf_perf_event_output(ctx, &output_map, BPF_F_CURRENT_CPU, &e, sizeof(e));
+	bpf_printk("passing packet");
+
+	return XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
